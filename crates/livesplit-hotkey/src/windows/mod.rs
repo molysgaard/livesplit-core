@@ -45,13 +45,18 @@ pub enum Error {
     MessageLoop,
 }
 
+struct KeyEvent {
+    pressed: bool,
+    hotkey: Hotkey,
+}
+
 /// The result type for this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A hook allows you to listen to hotkeys.
 pub struct Hook {
     thread_id: DWORD,
-    hotkeys: Arc<Mutex<HashMap<Hotkey, Box<dyn FnMut() + Send + 'static>>>>,
+    hotkeys: Arc<Mutex<HashMap<Hotkey, Box<dyn FnMut(bool) + Send + 'static>>>>,
 }
 
 impl Drop for Hook {
@@ -64,7 +69,7 @@ impl Drop for Hook {
 
 struct State {
     hook: HHOOK,
-    events: Sender<Hotkey>,
+    events: Sender<KeyEvent>,
     modifiers: Modifiers,
     // FIXME: Use variant count when it's stable.
     // https://github.com/rust-lang/rust/issues/73662
@@ -294,9 +299,12 @@ unsafe extern "system" fn callback_proc(code: c_int, wparam: WPARAM, lparam: LPA
 
                         state
                             .events
-                            .send(Hotkey {
-                                key_code,
-                                modifiers: state.modifiers,
+                            .send(KeyEvent {
+                                pressed: true,
+                                hotkey: Hotkey {
+                                    key_code,
+                                    modifiers: state.modifiers,
+                                },
                             })
                             .expect("Callback Thread disconnected");
 
@@ -346,6 +354,17 @@ unsafe extern "system" fn callback_proc(code: c_int, wparam: WPARAM, lparam: LPA
                     let (idx, bit) = key_idx(key_code);
                     state.key_state[idx as usize] &= !bit;
 
+                    state
+                        .events
+                        .send(KeyEvent {
+                            pressed: false,
+                            hotkey: Hotkey {
+                                key_code,
+                                modifiers: state.modifiers,
+                            },
+                        })
+                        .expect("Callback Thread disconnected");
+
                     match key_code {
                         KeyCode::AltLeft | KeyCode::AltRight => {
                             state.modifiers.remove(Modifiers::ALT);
@@ -380,7 +399,7 @@ impl Hook {
     pub fn new() -> Result<Self> {
         let hotkeys = Arc::new(Mutex::new(HashMap::<
             Hotkey,
-            Box<dyn FnMut() + Send + 'static>,
+            Box<dyn FnMut(bool) + Send + 'static>,
         >::new()));
 
         let (initialized_tx, initialized_rx) = channel();
@@ -440,9 +459,9 @@ impl Hook {
         let hotkey_map = hotkeys.clone();
 
         thread::spawn(move || {
-            while let Ok(key) = events_rx.recv() {
-                if let Some(callback) = hotkey_map.lock().unwrap().get_mut(&key) {
-                    callback();
+            while let Ok(KeyEvent { pressed, hotkey }) = events_rx.recv() {
+                if let Some(callback) = hotkey_map.lock().unwrap().get_mut(&hotkey) {
+                    callback(pressed);
                 }
             }
         });
@@ -455,7 +474,7 @@ impl Hook {
     /// Registers a hotkey to listen to.
     pub fn register<F>(&self, hotkey: Hotkey, callback: F) -> Result<()>
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut(bool) + Send + 'static,
     {
         if let Entry::Vacant(vacant) = self.hotkeys.lock().unwrap().entry(hotkey) {
             vacant.insert(Box::new(callback));
